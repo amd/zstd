@@ -943,6 +943,18 @@ static void ZSTD_DCtx_trace_end(ZSTD_DCtx const* dctx, U64 uncompressedSize, U64
     (void)compressedSize;
     (void)streaming;
 #endif
+#if ZSTD_TRACE_LOG
+    {   ZSTD_traceLog_OpCtx* traceLogCtx = (ZSTD_traceLog_OpCtx*)&dctx->traceLogCtx;
+        traceLogCtx->streaming = streaming;
+        if (streaming)
+            traceLogCtx->entryApi = "ZSTD_decompressStream";
+        if (dctx->ddict) {
+            traceLogCtx->dictID = ZSTD_getDictID_fromDDict(dctx->ddict);
+            traceLogCtx->dictSize = ZSTD_DDict_dictSize(dctx->ddict);
+        }
+        ZSTD_traceLog_endDecompress(traceLogCtx, uncompressedSize, compressedSize);
+    }
+#endif
 }
 
 
@@ -962,6 +974,7 @@ static size_t ZSTD_decompressFrame(ZSTD_DCtx* dctx,
     size_t remainingSrcSize = *srcSizePtr;
 
     DEBUGLOG(4, "ZSTD_decompressFrame (srcSize:%i)", (int)*srcSizePtr);
+    ZSTD_TRACE_LOG_FUNC(&dctx->traceLogCtx, "ZSTD_decompressFrame");
 
     /* check */
     RETURN_ERROR_IF(
@@ -1139,6 +1152,9 @@ size_t ZSTD_decompressMultiFrame(ZSTD_DCtx* dctx,
              * use this in all cases but ddict */
             FORWARD_IF_ERROR(ZSTD_decompressBegin_usingDict(dctx, dict, dictSize), "");
         }
+#if ZSTD_TRACE_LOG
+        dctx->traceLogCtx.entryApi = "ZSTD_decompress";
+#endif
         ZSTD_checkContinuity(dctx, dst, dstCapacity);
 
         {   const size_t res = ZSTD_decompressFrame(dctx, dst, dstCapacity,
@@ -1275,6 +1291,7 @@ static int ZSTD_isSkipFrame(ZSTD_DCtx* dctx) { return dctx->stage == ZSTDds_skip
 size_t ZSTD_decompressContinue(ZSTD_DCtx* dctx, void* dst, size_t dstCapacity, const void* src, size_t srcSize)
 {
     DEBUGLOG(5, "ZSTD_decompressContinue (srcSize:%u)", (unsigned)srcSize);
+    ZSTD_TRACE_LOG_FUNC(&dctx->traceLogCtx, "ZSTD_decompressContinue");
     /* Sanity check */
     RETURN_ERROR_IF(srcSize != ZSTD_nextSrcSizeToDecompressWithInputSize(dctx, srcSize), srcSize_wrong, "not allowed");
     ZSTD_checkContinuity(dctx, dst, dstCapacity);
@@ -1562,6 +1579,11 @@ size_t ZSTD_decompressBegin(ZSTD_DCtx* dctx)
     assert(dctx != NULL);
 #if ZSTD_TRACE
     dctx->traceCtx = (ZSTD_trace_decompress_begin != NULL) ? ZSTD_trace_decompress_begin(dctx) : 0;
+#endif
+#if ZSTD_TRACE_LOG
+    ZSTD_traceLog_begin(&dctx->traceLogCtx, 0);
+    dctx->traceLogCtx.entryApi = "ZSTD_decompressBegin";
+    ZSTD_TRACE_LOG_FUNC(&dctx->traceLogCtx, "ZSTD_decompressBegin");
 #endif
     dctx->expected = ZSTD_startingInputLength(dctx->format);  /* dctx->format must be properly set */
     dctx->stage = ZSTDds_getFrameHeaderSize;
@@ -2096,6 +2118,7 @@ size_t ZSTD_decompressStream(ZSTD_DStream* zds, ZSTD_outBuffer* output, ZSTD_inB
     U32 someMoreWork = 1;
 
     DEBUGLOG(5, "ZSTD_decompressStream");
+    ZSTD_TRACE_LOG_FUNC(&zds->traceLogCtx, "ZSTD_decompressStream");
     assert(zds != NULL);
     RETURN_ERROR_IF(
         input->pos > input->size,

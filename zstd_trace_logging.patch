@@ -1,0 +1,1399 @@
+diff --git a/build/cmake/lib/CMakeLists.txt b/build/cmake/lib/CMakeLists.txt
+index 4e902a1f..64ebdf6e 100644
+--- a/build/cmake/lib/CMakeLists.txt
++++ b/build/cmake/lib/CMakeLists.txt
+@@ -17,6 +17,8 @@ option(ZSTD_BUILD_DECOMPRESSION "BUILD DECOMPRESSION MODULE" ON)
+ option(ZSTD_BUILD_DICTBUILDER "BUILD DICTBUILDER MODULE" ON)
+ option(ZSTD_BUILD_DEPRECATED "BUILD DEPRECATED MODULE" OFF)
+ 
++option(ZSTD_TRACE_LOG "Enable file-based trace logging for diagnostics" ON)
++
+ set(ZSTDLIB_VISIBLE "" CACHE STRING "Visibility for ZSTDLIB API")
+ set(ZSTDERRORLIB_VISIBLE "" CACHE STRING "Visibility for ZSTDERRORLIB_VISIBLE API")
+ set(ZDICTLIB_VISIBLE "" CACHE STRING "Visibility for ZDICTLIB_VISIBLE API")
+@@ -134,6 +136,9 @@ if (ZSTD_BUILD_SHARED)
+     add_definition(libzstd_shared ZSTDLIB_VISIBLE)
+     add_definition(libzstd_shared ZSTDERRORLIB_VISIBLE)
+     add_definition(libzstd_shared ZDICTLIB_VISIBLE)
++    if (ZSTD_TRACE_LOG)
++        set_property(TARGET libzstd_shared APPEND PROPERTY COMPILE_DEFINITIONS "ZSTD_TRACE_LOG=1")
++    endif ()
+ endif ()
+ if (ZSTD_BUILD_STATIC)
+     add_library(libzstd_static STATIC ${Sources} ${Headers})
+@@ -150,6 +155,9 @@ if (ZSTD_BUILD_STATIC)
+     add_definition(libzstd_static ZDICTLIB_VISIBLE)
+     add_definition(libzstd_static ZSTDLIB_STATIC_API)
+     add_definition(libzstd_static ZDICTLIB_STATIC_API)
++    if (ZSTD_TRACE_LOG)
++        set_property(TARGET libzstd_static APPEND PROPERTY COMPILE_DEFINITIONS "ZSTD_TRACE_LOG=1")
++    endif ()
+ endif ()
+ if (ZSTD_BUILD_SHARED AND NOT ZSTD_BUILD_STATIC)
+     if (NOT BUILD_SHARED_LIBS)
+diff --git a/lib/common/zstd_trace_log.c b/lib/common/zstd_trace_log.c
+new file mode 100644
+index 00000000..cf1091e7
+--- /dev/null
++++ b/lib/common/zstd_trace_log.c
+@@ -0,0 +1,643 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ * All rights reserved.
++ *
++ * This source code is licensed under both the BSD-style license (found in the
++ * LICENSE file in the root directory of this source tree) and the GPLv2 (found
++ * in the COPYING file in the root directory of this source tree).
++ * You may select, at your option, one of the above-listed licenses.
++ */
++
++#include "zstd_trace_log.h"
++
++#if ZSTD_TRACE_LOG
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++/*=== Platform-specific includes (before zstd headers to avoid ERROR macro conflict) ===*/
++#if defined(_WIN32)
++#  define WIN32_LEAN_AND_MEAN
++#  include <windows.h>
++#  ifdef ERROR
++#    undef ERROR
++#  endif
++#else
++#  include <time.h>
++#  include <pthread.h>
++#  include <unistd.h>
++#  include <sys/stat.h>
++#endif
++
++#include "mem.h"
++#include "zstd_internal.h"
++#include "../compress/zstd_compress_internal.h"
++
++/*=== Cross-platform timing ===*/
++
++static S64 ZSTD_traceLog_getFrequency(void)
++{
++#if defined(_WIN32)
++    LARGE_INTEGER freq;
++    QueryPerformanceFrequency(&freq);
++    return (S64)freq.QuadPart;
++#else
++    return (S64)1000000000LL;
++#endif
++}
++
++static S64 ZSTD_traceLog_getTicks(void)
++{
++#if defined(_WIN32)
++    LARGE_INTEGER ticks;
++    QueryPerformanceCounter(&ticks);
++    return (S64)ticks.QuadPart;
++#else
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (S64)ts.tv_sec * 1000000000LL + (S64)ts.tv_nsec;
++#endif
++}
++
++static U64 ZSTD_traceLog_getThreadId(void)
++{
++#if defined(_WIN32)
++    return (U64)GetCurrentThreadId();
++#else
++    return (U64)(size_t)pthread_self();
++#endif
++}
++
++static U64 ZSTD_traceLog_getTimestampUs(void)
++{
++#if defined(_WIN32)
++    FILETIME ft;
++    U64 t;
++    GetSystemTimeAsFileTime(&ft);
++    t = ((U64)ft.dwHighDateTime << 32) | (U64)ft.dwLowDateTime;
++    return (t - 116444736000000000ULL) / 10;
++#else
++    struct timespec ts;
++    clock_gettime(CLOCK_REALTIME, &ts);
++    return (U64)ts.tv_sec * 1000000ULL + (U64)ts.tv_nsec / 1000;
++#endif
++}
++
++/*=== Atomic operation ID ===*/
++
++static U64 ZSTD_traceLog_nextOpId(void)
++{
++#if defined(_WIN32)
++    static volatile LONGLONG g_opCounter = 0;
++    return (U64)InterlockedIncrement64(&g_opCounter);
++#elif defined(__GNUC__) || defined(__clang__)
++    static U64 g_opCounter = 0;
++    return __atomic_fetch_add(&g_opCounter, 1, __ATOMIC_RELAXED) + 1;
++#elif defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L) && !defined(__STDC_NO_ATOMICS__)
++    #include <stdatomic.h>
++    static _Atomic U64 g_opCounter = 0;
++    return atomic_fetch_add_explicit(&g_opCounter, 1, memory_order_relaxed) + 1;
++#else
++    /* Fallback: not thread-safe. Acceptable because this path is only reached
++     * on compilers without atomics (rare), and operationId is only used for
++     * filename uniqueness — a duplicate is harmless (file gets overwritten). */
++    static U64 g_opCounter = 0;
++    return ++g_opCounter;
++#endif
++}
++
++/*=== API Implementation ===*/
++
++int ZSTD_traceLog_begin(ZSTD_traceLog_OpCtx* ctx, int isCompression)
++{
++    memset(ctx, 0, sizeof(*ctx));
++    ctx->isCompression = isCompression;
++    ctx->operationId = ZSTD_traceLog_nextOpId();
++    ctx->threadId = ZSTD_traceLog_getThreadId();
++    ctx->timestampUs = ZSTD_traceLog_getTimestampUs();
++    ctx->timer.frequency = ZSTD_traceLog_getFrequency();
++    ctx->timer.ticksStart = ZSTD_traceLog_getTicks();
++
++    ctx->blockStatsCapacity = 64;
++    ctx->blockStats = (ZSTD_traceLog_BlockStats*)malloc(
++        ctx->blockStatsCapacity * sizeof(ZSTD_traceLog_BlockStats));
++    if (ctx->blockStats == NULL) {
++        ctx->active = 0;
++        return -1;
++    }
++    ctx->active = 1;
++    return 0;
++}
++
++void ZSTD_traceLog_setParams(ZSTD_traceLog_OpCtx* ctx,
++                             const struct ZSTD_CCtx_params_s* params)
++{
++    if (!ctx->active) return;
++    ctx->compressionLevel = params->compressionLevel;
++    ctx->strategy = (U32)params->cParams.strategy;
++    ctx->windowLog = params->cParams.windowLog;
++    ctx->hashLog = params->cParams.hashLog;
++    ctx->chainLog = params->cParams.chainLog;
++    ctx->searchLog = params->cParams.searchLog;
++    ctx->minMatch = params->cParams.minMatch;
++    ctx->targetLength = params->cParams.targetLength;
++    ctx->nbWorkers = params->nbWorkers;
++    ctx->ldmEnabled = (params->ldmParams.enableLdm == ZSTD_ps_enable);
++    ctx->ldmHashLog = params->ldmParams.hashLog;
++    ctx->ldmMinMatch = params->ldmParams.minMatchLength;
++    ctx->ldmBucketSizeLog = params->ldmParams.bucketSizeLog;
++    ctx->ldmHashRateLog = params->ldmParams.hashRateLog;
++}
++
++void ZSTD_traceLog_logFunc(ZSTD_traceLog_OpCtx* ctx, const char* funcName)
++{
++    U32 idx;
++    S64 now;
++    U64 relUs;
++
++    if (!ctx->active) return;
++
++    now = ZSTD_traceLog_getTicks();
++    if (ctx->timer.frequency > 0) {
++        relUs = (U64)((now - ctx->timer.ticksStart) * 1000000LL / ctx->timer.frequency);
++    } else {
++        relUs = 0;
++    }
++
++    idx = ctx->callLogCount % ZSTD_TRACE_LOG_MAX_CALLS;
++    ctx->callLog[idx].funcName = funcName;
++    ctx->callLog[idx].relativeUs = (U32)relUs;
++    ctx->callLogCount++;
++    if (ctx->callLogCount > ZSTD_TRACE_LOG_MAX_CALLS) {
++        ctx->callLogWrapped = 1;
++    }
++}
++
++void ZSTD_traceLog_addBlock(ZSTD_traceLog_OpCtx* ctx,
++                            const void* seqStoreVoid,
++                            U32 blockSrcSize,
++                            U32 blockCSize,
++                            U32 ldmSequencesInBlock)
++{
++    const SeqStore_t* seqStore;
++    U32 nbSeqs;
++    U32 litBytesBlock = 0;
++    U32 matchBytesBlock = 0;
++    U32 repcodeBlock = 0;
++    U32 i;
++    ZSTD_traceLog_BlockStats* bs;
++
++    if (!ctx->active) return;
++
++    seqStore = (const SeqStore_t*)seqStoreVoid;
++    nbSeqs = (U32)(seqStore->sequences - seqStore->sequencesStart);
++
++    /* Grow blockStats if needed */
++    if (ctx->nbBlocks >= ctx->blockStatsCapacity) {
++        if (ctx->blockStatsCapacity >= ZSTD_TRACE_LOG_MAX_BLOCKS) {
++            /* Cap reached; just accumulate totals, skip per-block record */
++            goto accumulate_only;
++        }
++        {   U32 newCap = ctx->blockStatsCapacity * 2;
++            ZSTD_traceLog_BlockStats* newBuf;
++            if (newCap > ZSTD_TRACE_LOG_MAX_BLOCKS)
++                newCap = ZSTD_TRACE_LOG_MAX_BLOCKS;
++            newBuf = (ZSTD_traceLog_BlockStats*)realloc(
++                ctx->blockStats, newCap * sizeof(ZSTD_traceLog_BlockStats));
++            if (newBuf == NULL) goto accumulate_only;
++            ctx->blockStats = newBuf;
++            ctx->blockStatsCapacity = newCap;
++        }
++    }
++
++    bs = &ctx->blockStats[ctx->nbBlocks];
++    ctx->nbBlocks++;
++    bs->blockIndex = ctx->nbBlocks - 1;
++    bs->srcSize = blockSrcSize;
++    bs->cSize = blockCSize;
++    bs->nbSequences = nbSeqs;
++    bs->ldmSequences = ldmSequencesInBlock;
++
++accumulate_only:
++    for (i = 0; i < nbSeqs; i++) {
++        const SeqDef* seq = seqStore->sequencesStart + i;
++        ZSTD_SequenceLength seqLen = ZSTD_getSequenceLength(seqStore, seq);
++        U32 litLen = seqLen.litLength;
++        U32 matchLen = seqLen.matchLength;
++        U32 offBase = seq->offBase;
++
++        litBytesBlock += litLen;
++        matchBytesBlock += matchLen;
++
++        /* Literal run length histogram */
++        if (litLen == 0)          ctx->litRunHist.litRun_0++;
++        else if (litLen <= 3)     ctx->litRunHist.litRun_1_3++;
++        else if (litLen <= 15)    ctx->litRunHist.litRun_4_15++;
++        else if (litLen <= 63)    ctx->litRunHist.litRun_16_63++;
++        else                      ctx->litRunHist.litRun_64_plus++;
++
++        /* Repcode detection */
++        if (offBase <= ZSTD_REP_NUM) {
++            repcodeBlock++;
++        }
++
++        /* Match length histogram */
++        if (matchLen <= 4)        ctx->mlHist.ml_3_4++;
++        else if (matchLen <= 8)   ctx->mlHist.ml_5_8++;
++        else if (matchLen <= 16)  ctx->mlHist.ml_9_16++;
++        else if (matchLen <= 32)  ctx->mlHist.ml_17_32++;
++        else                      ctx->mlHist.ml_33_plus++;
++
++        /* Offset histogram (non-repcode only) */
++        if (offBase > ZSTD_REP_NUM) {
++            U32 realOffset = offBase - ZSTD_REP_NUM;
++            if (realOffset <= 256)        ctx->offHist.short_le256++;
++            else if (realOffset <= 4096)  ctx->offHist.medium_257_4096++;
++            else                          ctx->offHist.long_gt4096++;
++            /* Track max offset used */
++            if ((U64)realOffset > ctx->maxOffsetUsed)
++                ctx->maxOffsetUsed = (U64)realOffset;
++        }
++    }
++
++    /* Per-block record (only if we didn't skip due to cap) */
++    if (ctx->nbBlocks > 0 && ctx->nbBlocks <= ctx->blockStatsCapacity) {
++        ZSTD_traceLog_BlockStats* lastBs = &ctx->blockStats[ctx->nbBlocks - 1];
++        lastBs->totalLitBytes = litBytesBlock;
++        lastBs->totalMatchBytes = matchBytesBlock;
++        lastBs->repcodeCount = repcodeBlock;
++    }
++
++    /* Accumulate operation-level totals */
++    ctx->totalSequences += nbSeqs;
++    ctx->totalLitBytes += litBytesBlock;
++    ctx->totalMatchBytes += matchBytesBlock;
++    ctx->repcodeHits += repcodeBlock;
++    ctx->ldmSequences += ldmSequencesInBlock;
++}
++
++/*=== Strategy-specific recording ===*/
++
++void ZSTD_traceLog_recordLazyAttempt(ZSTD_traceLog_OpCtx* ctx)
++{
++    if (!ctx || !ctx->active) return;
++    ctx->lazyAttempts++;
++}
++
++void ZSTD_traceLog_recordLazyImprovement(ZSTD_traceLog_OpCtx* ctx, U32 oldLen, U32 newLen)
++{
++    if (!ctx || !ctx->active) return;
++    ctx->lazyImprovements++;
++    if (newLen > oldLen)
++        ctx->lazyImprovementDeltaSum += (U64)(newLen - oldLen);
++}
++
++void ZSTD_traceLog_recordSearchDepth(ZSTD_traceLog_OpCtx* ctx, U32 depthConsumed)
++{
++    if (!ctx || !ctx->active) return;
++    ctx->totalSearches++;
++    ctx->totalChainDepthConsumed += depthConsumed;
++}
++
++void ZSTD_traceLog_recordOptPositions(ZSTD_traceLog_OpCtx* ctx, U32 positions, U32 matches)
++{
++    if (!ctx || !ctx->active) return;
++    ctx->optPositionsEvaluated += positions;
++    ctx->optMatchesFound += matches;
++}
++
++void ZSTD_traceLog_recordBlockType(ZSTD_traceLog_OpCtx* ctx, int blockType)
++{
++    if (!ctx || !ctx->active) return;
++    switch (blockType) {
++        case 0: ctx->rawBlocks++; break;
++        case 1: ctx->rleBlocks++; break;
++        case 2: ctx->compressedBlocks++; break;
++    }
++}
++
++/*=== JSON Output ===*/
++
++static void ZSTD_traceLog_writeTimestamp(FILE* f, U64 timestampUs)
++{
++    U64 secs = timestampUs / 1000000;
++    U64 usRemainder = timestampUs % 1000000;
++    U64 hours, minutes, seconds;
++    U64 y, m, d;
++    U64 totalDays;
++
++    seconds = secs % 60; secs /= 60;
++    minutes = secs % 60; secs /= 60;
++    hours = secs % 24;
++    totalDays = secs / 24;
++
++    /* Simple civil date from days since epoch */
++    {   U64 z = totalDays + 719468;
++        U64 era = z / 146097;
++        U64 doe = z - era * 146097;
++        U64 yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
++        U64 doy, mp;
++        y = yoe + era * 400;
++        doy = doe - (365*yoe + yoe/4 - yoe/100);
++        mp = (5*doy + 2) / 153;
++        d = doy - (153*mp + 2)/5 + 1;
++        m = mp + (mp < 10 ? 3 : (U64)-9);
++        if (m <= 2) y++;
++    }
++
++    fprintf(f, "%04u-%02u-%02uT%02u:%02u:%02u.%06uZ",
++            (unsigned)y, (unsigned)m, (unsigned)d,
++            (unsigned)hours, (unsigned)minutes, (unsigned)seconds,
++            (unsigned)usRemainder);
++}
++
++static const char* ZSTD_traceLog_strategyName(U32 strategy)
++{
++    switch (strategy) {
++        case 1: return "fast";
++        case 2: return "dfast";
++        case 3: return "greedy";
++        case 4: return "lazy";
++        case 5: return "lazy2";
++        case 6: return "btlazy2";
++        case 7: return "btopt";
++        case 8: return "btultra";
++        case 9: return "btultra2";
++        default: return "unknown";
++    }
++}
++
++static void ZSTD_traceLog_writeJson(ZSTD_traceLog_OpCtx* ctx, FILE* f)
++{
++    double ratio = 0.0;
++    double litToMatchFrac = 0.0;
++    double repcodeRate = 0.0;
++    double throughput = 0.0;
++    U32 i;
++
++    if (ctx->dstSize > 0 && ctx->isCompression)
++        ratio = (double)ctx->srcSize / (double)ctx->dstSize;
++    else if (ctx->srcSize > 0 && !ctx->isCompression)
++        ratio = (double)ctx->dstSize / (double)ctx->srcSize;
++
++    if (ctx->totalMatchBytes > 0)
++        litToMatchFrac = (double)ctx->totalLitBytes / (double)ctx->totalMatchBytes;
++    if (ctx->totalSequences > 0)
++        repcodeRate = (double)ctx->repcodeHits / (double)ctx->totalSequences;
++    if (ctx->durationUs > 0) {
++        U64 bytes = ctx->isCompression ? ctx->srcSize : ctx->dstSize;
++        throughput = (double)bytes / (double)ctx->durationUs;
++    }
++
++    fprintf(f, "{\n");
++    fprintf(f, "  \"version\": \"1.0\",\n");
++    fprintf(f, "  \"operation\": \"%s\",\n", ctx->isCompression ? "compress" : "decompress");
++    fprintf(f, "  \"entryApi\": \"%s\",\n", ctx->entryApi ? ctx->entryApi : "unknown");
++    fprintf(f, "  \"operationId\": %llu,\n", (unsigned long long)ctx->operationId);
++    fprintf(f, "  \"threadId\": %llu,\n", (unsigned long long)ctx->threadId);
++    fprintf(f, "  \"timestamp\": \"");
++    ZSTD_traceLog_writeTimestamp(f, ctx->timestampUs);
++    fprintf(f, "\",\n");
++    fprintf(f, "  \"streaming\": %s,\n", ctx->streaming ? "true" : "false");
++
++    /* Sizes */
++    fprintf(f, "  \"sizes\": {\n");
++    fprintf(f, "    \"srcBytes\": %llu,\n", (unsigned long long)ctx->srcSize);
++    fprintf(f, "    \"dstBytes\": %llu,\n", (unsigned long long)ctx->dstSize);
++    fprintf(f, "    \"ratio\": %.4f\n", ratio);
++    fprintf(f, "  },\n");
++
++    /* Parameters (compression only) */
++    if (ctx->isCompression) {
++        fprintf(f, "  \"params\": {\n");
++        fprintf(f, "    \"level\": %d,\n", ctx->compressionLevel);
++        fprintf(f, "    \"strategy\": \"%s\",\n", ZSTD_traceLog_strategyName(ctx->strategy));
++        fprintf(f, "    \"windowLog\": %u,\n", (unsigned)ctx->windowLog);
++        fprintf(f, "    \"hashLog\": %u,\n", (unsigned)ctx->hashLog);
++        fprintf(f, "    \"chainLog\": %u,\n", (unsigned)ctx->chainLog);
++        fprintf(f, "    \"searchLog\": %u,\n", (unsigned)ctx->searchLog);
++        fprintf(f, "    \"minMatch\": %u,\n", (unsigned)ctx->minMatch);
++        fprintf(f, "    \"targetLength\": %u,\n", (unsigned)ctx->targetLength);
++        fprintf(f, "    \"nbWorkers\": %d,\n", ctx->nbWorkers);
++        fprintf(f, "    \"dictID\": %u,\n", (unsigned)ctx->dictID);
++        fprintf(f, "    \"dictSize\": %llu,\n", (unsigned long long)ctx->dictSize);
++        fprintf(f, "    \"ldm\": {\n");
++        fprintf(f, "      \"enabled\": %s", ctx->ldmEnabled ? "true" : "false");
++        if (ctx->ldmEnabled) {
++            fprintf(f, ",\n");
++            fprintf(f, "      \"hashLog\": %u,\n", (unsigned)ctx->ldmHashLog);
++            fprintf(f, "      \"minMatch\": %u,\n", (unsigned)ctx->ldmMinMatch);
++            fprintf(f, "      \"bucketSizeLog\": %u,\n", (unsigned)ctx->ldmBucketSizeLog);
++            fprintf(f, "      \"hashRateLog\": %u\n", (unsigned)ctx->ldmHashRateLog);
++        } else {
++            fprintf(f, "\n");
++        }
++        fprintf(f, "    }\n");
++        fprintf(f, "  },\n");
++    }
++
++    /* Sequence stats (compression only) */
++    if (ctx->isCompression) {
++        fprintf(f, "  \"sequences\": {\n");
++        fprintf(f, "    \"totalCount\": %llu,\n", (unsigned long long)ctx->totalSequences);
++        fprintf(f, "    \"totalLitBytes\": %llu,\n", (unsigned long long)ctx->totalLitBytes);
++        fprintf(f, "    \"totalMatchBytes\": %llu,\n", (unsigned long long)ctx->totalMatchBytes);
++        fprintf(f, "    \"litToMatchFraction\": %.4f,\n", litToMatchFrac);
++        fprintf(f, "    \"repcodeHits\": %llu,\n", (unsigned long long)ctx->repcodeHits);
++        fprintf(f, "    \"repcodeRate\": %.4f,\n", repcodeRate);
++        fprintf(f, "    \"ldmSequences\": %llu,\n", (unsigned long long)ctx->ldmSequences);
++        fprintf(f, "    \"matchLengthHistogram\": {\n");
++        fprintf(f, "      \"3_4\": %u,\n", (unsigned)ctx->mlHist.ml_3_4);
++        fprintf(f, "      \"5_8\": %u,\n", (unsigned)ctx->mlHist.ml_5_8);
++        fprintf(f, "      \"9_16\": %u,\n", (unsigned)ctx->mlHist.ml_9_16);
++        fprintf(f, "      \"17_32\": %u,\n", (unsigned)ctx->mlHist.ml_17_32);
++        fprintf(f, "      \"33_plus\": %u\n", (unsigned)ctx->mlHist.ml_33_plus);
++        fprintf(f, "    },\n");
++        fprintf(f, "    \"offsetHistogram\": {\n");
++        fprintf(f, "      \"short_le256\": %u,\n", (unsigned)ctx->offHist.short_le256);
++        fprintf(f, "      \"medium_257_4096\": %u,\n", (unsigned)ctx->offHist.medium_257_4096);
++        fprintf(f, "      \"long_gt4096\": %u\n", (unsigned)ctx->offHist.long_gt4096);
++        fprintf(f, "    }\n");
++        fprintf(f, "  },\n");
++
++        /* Per-block stats */
++        fprintf(f, "  \"blocks\": [\n");
++        for (i = 0; i < ctx->nbBlocks && i < ctx->blockStatsCapacity; i++) {
++            const ZSTD_traceLog_BlockStats* bs = &ctx->blockStats[i];
++            double blockRatio = (bs->cSize > 0) ? (double)bs->srcSize / (double)bs->cSize : 0.0;
++            fprintf(f, "    {");
++            fprintf(f, "\"index\": %u, ", (unsigned)bs->blockIndex);
++            fprintf(f, "\"srcSize\": %u, ", (unsigned)bs->srcSize);
++            fprintf(f, "\"cSize\": %u, ", (unsigned)bs->cSize);
++            fprintf(f, "\"ratio\": %.4f, ", blockRatio);
++            fprintf(f, "\"nbSequences\": %u, ", (unsigned)bs->nbSequences);
++            fprintf(f, "\"litBytes\": %u, ", (unsigned)bs->totalLitBytes);
++            fprintf(f, "\"matchBytes\": %u, ", (unsigned)bs->totalMatchBytes);
++            fprintf(f, "\"repcodeCount\": %u, ", (unsigned)bs->repcodeCount);
++            fprintf(f, "\"ldmSequences\": %u", (unsigned)bs->ldmSequences);
++            fprintf(f, "}%s\n", (i + 1 < ctx->nbBlocks && i + 1 < ctx->blockStatsCapacity) ? "," : "");
++        }
++        fprintf(f, "  ],\n");
++    }
++
++    /* Strategy-specific metrics (compression only) */
++    if (ctx->isCompression) {
++        fprintf(f, "  \"strategyMetrics\": {\n");
++        fprintf(f, "    \"lazyAttempts\": %llu,\n", (unsigned long long)ctx->lazyAttempts);
++        fprintf(f, "    \"lazyImprovements\": %llu,\n", (unsigned long long)ctx->lazyImprovements);
++        fprintf(f, "    \"lazyImprovementDeltaSum\": %llu,\n", (unsigned long long)ctx->lazyImprovementDeltaSum);
++        if (ctx->lazyImprovements > 0)
++            fprintf(f, "    \"lazyAvgImprovement\": %.2f,\n",
++                    (double)ctx->lazyImprovementDeltaSum / (double)ctx->lazyImprovements);
++        fprintf(f, "    \"totalSearches\": %llu,\n", (unsigned long long)ctx->totalSearches);
++        fprintf(f, "    \"totalChainDepthConsumed\": %llu,\n", (unsigned long long)ctx->totalChainDepthConsumed);
++        if (ctx->totalSearches > 0)
++            fprintf(f, "    \"avgSearchDepth\": %.2f,\n",
++                    (double)ctx->totalChainDepthConsumed / (double)ctx->totalSearches);
++        fprintf(f, "    \"optPositionsEvaluated\": %llu,\n", (unsigned long long)ctx->optPositionsEvaluated);
++        fprintf(f, "    \"optMatchesFound\": %llu,\n", (unsigned long long)ctx->optMatchesFound);
++        fprintf(f, "    \"maxOffsetUsed\": %llu,\n", (unsigned long long)ctx->maxOffsetUsed);
++        if (ctx->srcSize > 0)
++            fprintf(f, "    \"sequenceDensityPerKB\": %.2f,\n",
++                    (double)ctx->totalSequences * 1024.0 / (double)ctx->srcSize);
++        fprintf(f, "    \"blockTypes\": {\"raw\": %u, \"rle\": %u, \"compressed\": %u},\n",
++                (unsigned)ctx->rawBlocks, (unsigned)ctx->rleBlocks, (unsigned)ctx->compressedBlocks);
++        fprintf(f, "    \"litRunHistogram\": {\n");
++        fprintf(f, "      \"0\": %u,\n", (unsigned)ctx->litRunHist.litRun_0);
++        fprintf(f, "      \"1_3\": %u,\n", (unsigned)ctx->litRunHist.litRun_1_3);
++        fprintf(f, "      \"4_15\": %u,\n", (unsigned)ctx->litRunHist.litRun_4_15);
++        fprintf(f, "      \"16_63\": %u,\n", (unsigned)ctx->litRunHist.litRun_16_63);
++        fprintf(f, "      \"64_plus\": %u\n", (unsigned)ctx->litRunHist.litRun_64_plus);
++        fprintf(f, "    }\n");
++        fprintf(f, "  },\n");
++    }
++
++    /* Timing */
++    fprintf(f, "  \"timing\": {\n");
++    fprintf(f, "    \"durationUs\": %llu,\n", (unsigned long long)ctx->durationUs);
++    fprintf(f, "    \"throughputMBps\": %.2f\n", throughput);
++    fprintf(f, "  },\n");
++
++    /* Function call log */
++    {   U32 logCount = ctx->callLogCount;
++        U32 startIdx = 0;
++        U32 numEntries = logCount;
++        if (logCount > ZSTD_TRACE_LOG_MAX_CALLS) {
++            numEntries = ZSTD_TRACE_LOG_MAX_CALLS;
++            startIdx = logCount % ZSTD_TRACE_LOG_MAX_CALLS;
++        }
++        fprintf(f, "  \"callLog\": [\n");
++        for (i = 0; i < numEntries; i++) {
++            U32 idx = (startIdx + i) % ZSTD_TRACE_LOG_MAX_CALLS;
++            const ZSTD_traceLog_CallEntry* entry = &ctx->callLog[idx];
++            fprintf(f, "    {\"func\": \"%s\", \"relativeUs\": %u}%s\n",
++                    entry->funcName,
++                    (unsigned)entry->relativeUs,
++                    (i + 1 < numEntries) ? "," : "");
++        }
++        fprintf(f, "  ]\n");
++    }
++
++    fprintf(f, "}\n");
++}
++
++static void ZSTD_traceLog_ensureDir(const char* dir)
++{
++#if defined(_WIN32)
++    CreateDirectoryA(dir, NULL);
++#else
++    mkdir(dir, 0755);
++#endif
++}
++
++static FILE* ZSTD_traceLog_openFile(const ZSTD_traceLog_OpCtx* ctx)
++{
++    char path[512];
++    const char* dir = getenv("ZSTD_TRACE_LOG_DIR");
++    const char* op = ctx->isCompression ? "compress" : "decompress";
++    const char* mode = ctx->streaming ? "_stream" : "";
++    if (dir == NULL || dir[0] == '\0') dir = "zstd_traces";
++
++    ZSTD_traceLog_ensureDir(dir);
++
++#if defined(_WIN32)
++    _snprintf_s(path, sizeof(path), _TRUNCATE,
++                "%s\\zstd_trace_%s%s_%llu_%llu_%llu.json",
++                dir, op, mode,
++                (unsigned long long)ctx->timestampUs,
++                (unsigned long long)ctx->threadId,
++                (unsigned long long)ctx->operationId);
++#else
++    snprintf(path, sizeof(path),
++             "%s/zstd_trace_%s%s_%llu_%llu_%llu.json",
++             dir, op, mode,
++             (unsigned long long)ctx->timestampUs,
++             (unsigned long long)ctx->threadId,
++             (unsigned long long)ctx->operationId);
++#endif
++    return fopen(path, "w");
++}
++
++void ZSTD_traceLog_end(ZSTD_traceLog_OpCtx* ctx,
++                       U64 finalSrcSize,
++                       U64 finalDstSize)
++{
++    FILE* f;
++    S64 ticksEnd;
++
++    if (!ctx->active) return;
++
++    ctx->srcSize = finalSrcSize;
++    ctx->dstSize = finalDstSize;
++
++    /* Compute duration */
++    ticksEnd = ZSTD_traceLog_getTicks();
++    if (ctx->timer.frequency > 0) {
++        ctx->durationUs = (U64)((ticksEnd - ctx->timer.ticksStart) * 1000000LL / ctx->timer.frequency);
++    }
++
++    f = ZSTD_traceLog_openFile(ctx);
++    if (f != NULL) {
++        ZSTD_traceLog_writeJson(ctx, f);
++        fclose(f);
++    }
++
++    /* Cleanup */
++    free(ctx->blockStats);
++    ctx->blockStats = NULL;
++    ctx->active = 0;
++}
++
++void ZSTD_traceLog_endDecompress(ZSTD_traceLog_OpCtx* ctx,
++                                 U64 uncompressedSize,
++                                 U64 compressedSize)
++{
++    FILE* f;
++    S64 ticksEnd;
++
++    if (!ctx->active) return;
++
++    ctx->srcSize = compressedSize;
++    ctx->dstSize = uncompressedSize;
++    ctx->isCompression = 0;
++
++    /* Compute duration */
++    ticksEnd = ZSTD_traceLog_getTicks();
++    if (ctx->timer.frequency > 0) {
++        ctx->durationUs = (U64)((ticksEnd - ctx->timer.ticksStart) * 1000000LL / ctx->timer.frequency);
++    }
++
++    f = ZSTD_traceLog_openFile(ctx);
++    if (f != NULL) {
++        ZSTD_traceLog_writeJson(ctx, f);
++        fclose(f);
++    }
++
++    /* Cleanup */
++    free(ctx->blockStats);
++    ctx->blockStats = NULL;
++    ctx->active = 0;
++}
++
++#endif /* ZSTD_TRACE_LOG */
+diff --git a/lib/common/zstd_trace_log.h b/lib/common/zstd_trace_log.h
+new file mode 100644
+index 00000000..77488c37
+--- /dev/null
++++ b/lib/common/zstd_trace_log.h
+@@ -0,0 +1,202 @@
++/*
++ * Copyright (c) Meta Platforms, Inc. and affiliates.
++ * All rights reserved.
++ *
++ * This source code is licensed under both the BSD-style license (found in the
++ * LICENSE file in the root directory of this source tree) and the GPLv2 (found
++ * in the COPYING file in the root directory of this source tree).
++ * You may select, at your option, one of the above-listed licenses.
++ */
++
++#ifndef ZSTD_TRACE_LOG_H
++#define ZSTD_TRACE_LOG_H
++
++#ifndef ZSTD_TRACE_LOG
++#  define ZSTD_TRACE_LOG 0
++#endif
++
++#if ZSTD_TRACE_LOG
++
++#include <stddef.h>
++#include "mem.h"
++
++/* Forward declarations */
++struct ZSTD_CCtx_params_s;
++
++/*--- Match length histogram bins ---*/
++typedef struct {
++    U32 ml_3_4;
++    U32 ml_5_8;
++    U32 ml_9_16;
++    U32 ml_17_32;
++    U32 ml_33_plus;
++} ZSTD_traceLog_MLHist;
++
++/*--- Offset distance histogram bins ---*/
++typedef struct {
++    U32 short_le256;
++    U32 medium_257_4096;
++    U32 long_gt4096;
++} ZSTD_traceLog_OffHist;
++
++/*--- Literal run length histogram bins ---*/
++typedef struct {
++    U32 litRun_0;
++    U32 litRun_1_3;
++    U32 litRun_4_15;
++    U32 litRun_16_63;
++    U32 litRun_64_plus;
++} ZSTD_traceLog_LitRunHist;
++
++/*--- Per-block stats ---*/
++typedef struct {
++    U32 blockIndex;
++    U32 srcSize;
++    U32 cSize;
++    U32 nbSequences;
++    U32 totalLitBytes;
++    U32 totalMatchBytes;
++    U32 repcodeCount;
++    U32 ldmSequences;
++} ZSTD_traceLog_BlockStats;
++
++/*--- Timer (platform-specific internals) ---*/
++typedef struct {
++    S64 ticksStart;
++    S64 frequency;
++} ZSTD_traceLog_Timer;
++
++/*--- Maximum blocks tracked per operation ---*/
++#define ZSTD_TRACE_LOG_MAX_BLOCKS 1024
++
++/*--- Function call log ---*/
++#define ZSTD_TRACE_LOG_MAX_CALLS 256
++
++typedef struct {
++    const char* funcName;
++    U32 relativeUs;
++} ZSTD_traceLog_CallEntry;
++
++/*--- Operation context: one per compress/decompress call ---*/
++typedef struct {
++    /* Identity */
++    U64 operationId;
++    U64 threadId;
++    U64 timestampUs;
++
++    /* Sizes */
++    U64 srcSize;
++    U64 dstSize;
++
++    /* Parameters (compression only) */
++    int compressionLevel;
++    U32 strategy;
++    U32 windowLog;
++    U32 hashLog;
++    U32 chainLog;
++    U32 searchLog;
++    U32 minMatch;
++    U32 targetLength;
++    int nbWorkers;
++    U32 dictID;
++    U64 dictSize;
++    int ldmEnabled;
++    U32 ldmHashLog;
++    U32 ldmMinMatch;
++    U32 ldmBucketSizeLog;
++    U32 ldmHashRateLog;
++
++    /* Sequence-level aggregates */
++    U64 totalSequences;
++    U64 totalLitBytes;
++    U64 totalMatchBytes;
++    U64 repcodeHits;
++    U64 ldmSequences;
++    ZSTD_traceLog_MLHist mlHist;
++    ZSTD_traceLog_OffHist offHist;
++
++    /* Strategy-specific stats */
++    U64 lazyAttempts;
++    U64 lazyImprovements;
++    U64 lazyImprovementDeltaSum;
++    U64 totalSearches;
++    U64 totalChainDepthConsumed;
++    U64 optPositionsEvaluated;
++    U64 optMatchesFound;
++    U64 maxOffsetUsed;
++    U32 rawBlocks;
++    U32 rleBlocks;
++    U32 compressedBlocks;
++    ZSTD_traceLog_LitRunHist litRunHist;
++
++    /* Per-block stats */
++    U32 nbBlocks;
++    U32 blockStatsCapacity;
++    ZSTD_traceLog_BlockStats* blockStats;
++
++    /* Timing */
++    ZSTD_traceLog_Timer timer;
++    U64 durationUs;
++
++    /* Operation metadata */
++    int isCompression;
++    int streaming;
++    int active;
++    const char* entryApi;
++
++    /* Function call log (ring buffer) */
++    U32 callLogCount;
++    U32 callLogWrapped;
++    ZSTD_traceLog_CallEntry callLog[ZSTD_TRACE_LOG_MAX_CALLS];
++} ZSTD_traceLog_OpCtx;
++
++/*====== API ======*/
++
++int  ZSTD_traceLog_begin(ZSTD_traceLog_OpCtx* ctx, int isCompression);
++
++void ZSTD_traceLog_setParams(ZSTD_traceLog_OpCtx* ctx,
++                             const struct ZSTD_CCtx_params_s* params);
++
++void ZSTD_traceLog_addBlock(ZSTD_traceLog_OpCtx* ctx,
++                            const void* seqStore,
++                            U32 blockSrcSize,
++                            U32 blockCSize,
++                            U32 ldmSequencesInBlock);
++
++void ZSTD_traceLog_end(ZSTD_traceLog_OpCtx* ctx,
++                       U64 finalSrcSize,
++                       U64 finalDstSize);
++
++void ZSTD_traceLog_endDecompress(ZSTD_traceLog_OpCtx* ctx,
++                                 U64 uncompressedSize,
++                                 U64 compressedSize);
++
++void ZSTD_traceLog_logFunc(ZSTD_traceLog_OpCtx* ctx, const char* funcName);
++
++#define ZSTD_TRACE_LOG_FUNC(ctx, name) ZSTD_traceLog_logFunc(ctx, name)
++
++/* Strategy-specific recording */
++void ZSTD_traceLog_recordLazyAttempt(ZSTD_traceLog_OpCtx* ctx);
++void ZSTD_traceLog_recordLazyImprovement(ZSTD_traceLog_OpCtx* ctx, U32 oldLen, U32 newLen);
++void ZSTD_traceLog_recordSearchDepth(ZSTD_traceLog_OpCtx* ctx, U32 depthConsumed);
++void ZSTD_traceLog_recordOptPositions(ZSTD_traceLog_OpCtx* ctx, U32 positions, U32 matches);
++void ZSTD_traceLog_recordBlockType(ZSTD_traceLog_OpCtx* ctx, int blockType);
++
++#else /* ZSTD_TRACE_LOG == 0 */
++
++typedef int ZSTD_traceLog_OpCtx;
++#define ZSTD_traceLog_begin(ctx, isc)            ((void)(ctx), (void)(isc), 0)
++#define ZSTD_traceLog_setParams(ctx, p)          ((void)(ctx), (void)(p))
++#define ZSTD_traceLog_addBlock(ctx, ss, bs, cs, ldm) \
++    ((void)(ctx), (void)(ss), (void)(bs), (void)(cs), (void)(ldm))
++#define ZSTD_traceLog_end(ctx, s, d)             ((void)(ctx), (void)(s), (void)(d))
++#define ZSTD_traceLog_endDecompress(ctx, u, c)   ((void)(ctx), (void)(u), (void)(c))
++#define ZSTD_TRACE_LOG_FUNC(ctx, name)           ((void)(ctx), (void)(name))
++#define ZSTD_traceLog_recordLazyAttempt(ctx)     ((void)(ctx))
++#define ZSTD_traceLog_recordLazyImprovement(ctx,o,n) ((void)(ctx),(void)(o),(void)(n))
++#define ZSTD_traceLog_recordSearchDepth(ctx,d)   ((void)(ctx),(void)(d))
++#define ZSTD_traceLog_recordOptPositions(ctx,p,m) ((void)(ctx),(void)(p),(void)(m))
++#define ZSTD_traceLog_recordBlockType(ctx,t)     ((void)(ctx),(void)(t))
++
++#endif /* ZSTD_TRACE_LOG */
++#endif /* ZSTD_TRACE_LOG_H */
+diff --git a/lib/compress/zstd_compress.c b/lib/compress/zstd_compress.c
+index d928b1d3..8ba1277a 100644
+--- a/lib/compress/zstd_compress.c
++++ b/lib/compress/zstd_compress.c
+@@ -3265,6 +3265,10 @@ static size_t ZSTD_buildSeqStore(ZSTD_CCtx* zc, const void* src, size_t srcSize)
+ {
+     ZSTD_MatchState_t* const ms = &zc->blockState.matchState;
+     DEBUGLOG(5, "ZSTD_buildSeqStore (srcSize=%zu)", srcSize);
++    ZSTD_TRACE_LOG_FUNC(&zc->traceLogCtx, "ZSTD_buildSeqStore");
++#if ZSTD_TRACE_LOG
++    ms->traceLogCtx = &zc->traceLogCtx;
++#endif
+     assert(srcSize <= ZSTD_BLOCKSIZE_MAX);
+     /* Assert that we have correctly flushed the ctx params into the ms's copy */
+     ZSTD_assertEqualCParams(zc->appliedParams.cParams, ms->cParams);
+@@ -4369,11 +4373,19 @@ ZSTD_compressBlock_splitBlock(ZSTD_CCtx* zc,
+             cSize = ZSTD_noCompressBlock(dst, dstCapacity, src, srcSize, lastBlock);
+             FORWARD_IF_ERROR(cSize, "ZSTD_noCompressBlock failed");
+             DEBUGLOG(5, "ZSTD_compressBlock_splitBlock: Nocompress block");
++#if ZSTD_TRACE_LOG
++            ZSTD_traceLog_recordBlockType(&zc->traceLogCtx, 0);
++#endif
+             return cSize;
+         }
+         nbSeq = (U32)(zc->seqStore.sequences - zc->seqStore.sequencesStart);
+     }
+ 
++#if ZSTD_TRACE_LOG
++    ZSTD_traceLog_addBlock(&zc->traceLogCtx, &zc->seqStore,
++                           (U32)srcSize, 0, 0);
++    ZSTD_traceLog_recordBlockType(&zc->traceLogCtx, 2);
++#endif
+     cSize = ZSTD_compressBlock_splitBlock_internal(zc, dst, dstCapacity, src, srcSize, lastBlock, nbSeq);
+     FORWARD_IF_ERROR(cSize, "Splitting blocks failed!");
+     return cSize;
+@@ -4395,6 +4407,7 @@ ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
+     DEBUGLOG(5, "ZSTD_compressBlock_internal (dstCapacity=%u, dictLimit=%u, nextToUpdate=%u)",
+                 (unsigned)dstCapacity, (unsigned)zc->blockState.matchState.window.dictLimit,
+                 (unsigned)zc->blockState.matchState.nextToUpdate);
++    ZSTD_TRACE_LOG_FUNC(&zc->traceLogCtx, "ZSTD_compressBlock_internal");
+ 
+     {   const size_t bss = ZSTD_buildSeqStore(zc, src, srcSize);
+         FORWARD_IF_ERROR(bss, "ZSTD_buildSeqStore failed");
+@@ -4436,7 +4449,19 @@ ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
+ out:
+     if (!ZSTD_isError(cSize) && cSize > 1) {
+         ZSTD_blockState_confirmRepcodesAndEntropyTables(&zc->blockState);
++#if ZSTD_TRACE_LOG
++        ZSTD_traceLog_addBlock(&zc->traceLogCtx, &zc->seqStore,
++                               (U32)srcSize, (U32)cSize, 0);
++        ZSTD_traceLog_recordBlockType(&zc->traceLogCtx, 2);
++#endif
++    }
++#if ZSTD_TRACE_LOG
++    else if (!ZSTD_isError(cSize) && cSize == 0) {
++        ZSTD_traceLog_recordBlockType(&zc->traceLogCtx, 0);
++    } else if (!ZSTD_isError(cSize) && cSize == 1) {
++        ZSTD_traceLog_recordBlockType(&zc->traceLogCtx, 1);
+     }
++#endif
+     /* We check that dictionaries have offset codes available for the first
+      * block. After the first block, the offcode table might not have large
+      * enough codes to represent the offsets in the data.
+@@ -4602,6 +4627,7 @@ static size_t ZSTD_compress_frameChunk(ZSTD_CCtx* cctx,
+     S64 savings = (S64)cctx->consumedSrcSize - (S64)cctx->producedCSize;
+ 
+     assert(cctx->appliedParams.cParams.windowLog <= ZSTD_WINDOWLOG_MAX);
++    ZSTD_TRACE_LOG_FUNC(&cctx->traceLogCtx, "ZSTD_compress_frameChunk");
+ 
+     DEBUGLOG(5, "ZSTD_compress_frameChunk (srcSize=%u, blockSizeMax=%u)", (unsigned)srcSize, (unsigned)blockSizeMax);
+     if (cctx->appliedParams.fParams.checksumFlag && srcSize)
+@@ -4799,6 +4825,7 @@ static size_t ZSTD_compressContinue_internal (ZSTD_CCtx* cctx,
+ 
+     DEBUGLOG(5, "ZSTD_compressContinue_internal, stage: %u, srcSize: %u",
+                 cctx->stage, (unsigned)srcSize);
++    ZSTD_TRACE_LOG_FUNC(&cctx->traceLogCtx, "ZSTD_compressContinue_internal");
+     RETURN_ERROR_IF(cctx->stage==ZSTDcs_created, stage_wrong,
+                     "missing init (ZSTD_compressBegin)");
+ 
+@@ -5246,6 +5273,12 @@ static size_t ZSTD_compressBegin_internal(ZSTD_CCtx* cctx,
+     size_t const dictContentSize = cdict ? cdict->dictContentSize : dictSize;
+ #if ZSTD_TRACE
+     cctx->traceCtx = (ZSTD_trace_compress_begin != NULL) ? ZSTD_trace_compress_begin(cctx) : 0;
++#endif
++#if ZSTD_TRACE_LOG
++    ZSTD_traceLog_begin(&cctx->traceLogCtx, 1);
++    ZSTD_traceLog_setParams(&cctx->traceLogCtx, params);
++    cctx->traceLogCtx.entryApi = "ZSTD_compressBegin_internal";
++    ZSTD_TRACE_LOG_FUNC(&cctx->traceLogCtx, "ZSTD_compressBegin_internal");
+ #endif
+     DEBUGLOG(4, "ZSTD_compressBegin_internal: wlog=%u", params->cParams.windowLog);
+     /* params are supposed to be fully validated at this point */
+@@ -5402,6 +5435,16 @@ void ZSTD_CCtx_trace(ZSTD_CCtx* cctx, size_t extraCSize)
+     (void)cctx;
+     (void)extraCSize;
+ #endif
++#if ZSTD_TRACE_LOG
++    {   int const streaming = cctx->inBuffSize > 0 || cctx->outBuffSize > 0 || cctx->appliedParams.nbWorkers > 0;
++        cctx->traceLogCtx.streaming = streaming;
++        cctx->traceLogCtx.dictID = cctx->dictID;
++        cctx->traceLogCtx.dictSize = cctx->dictContentSize;
++        ZSTD_traceLog_end(&cctx->traceLogCtx,
++                          cctx->consumedSrcSize,
++                          cctx->producedCSize + extraCSize);
++    }
++#endif
+ }
+ 
+ size_t ZSTD_compressEnd_public(ZSTD_CCtx* cctx,
+@@ -5466,6 +5509,9 @@ size_t ZSTD_compress_advanced_internal(
+     FORWARD_IF_ERROR( ZSTD_compressBegin_internal(cctx,
+                          dict, dictSize, ZSTD_dct_auto, ZSTD_dtlm_fast, NULL,
+                          params, srcSize, ZSTDb_not_buffered) , "");
++#if ZSTD_TRACE_LOG
++    cctx->traceLogCtx.entryApi = "ZSTD_compress2";
++#endif
+     return ZSTD_compressEnd_public(cctx, dst, dstCapacity, src, srcSize);
+ }
+ 
+@@ -6396,6 +6442,12 @@ static size_t ZSTD_CCtx_init_compressStream2(ZSTD_CCtx* cctx,
+ # if ZSTD_TRACE
+         cctx->traceCtx = (ZSTD_trace_compress_begin != NULL) ? ZSTD_trace_compress_begin(cctx) : 0;
+ # endif
++#if ZSTD_TRACE_LOG
++        ZSTD_traceLog_begin(&cctx->traceLogCtx, 1);
++        ZSTD_traceLog_setParams(&cctx->traceLogCtx, &params);
++        cctx->traceLogCtx.entryApi = "ZSTD_compressStream2";
++        ZSTD_TRACE_LOG_FUNC(&cctx->traceLogCtx, "ZSTD_CCtx_init_compressStream2[MT]");
++#endif
+         /* mt context creation */
+         if (cctx->mtctx == NULL) {
+             DEBUGLOG(4, "ZSTD_compressStream2: creating new mtctx for nbWorkers=%u",
+@@ -6424,6 +6476,9 @@ static size_t ZSTD_CCtx_init_compressStream2(ZSTD_CCtx* cctx,
+                 cctx->cdict,
+                 &params, pledgedSrcSize,
+                 ZSTDb_buffered) , "");
++#if ZSTD_TRACE_LOG
++        cctx->traceLogCtx.entryApi = "ZSTD_compressStream2";
++#endif
+         assert(cctx->appliedParams.nbWorkers == 0);
+         cctx->inToCompress = 0;
+         cctx->inBuffPos = 0;
+diff --git a/lib/compress/zstd_compress_internal.h b/lib/compress/zstd_compress_internal.h
+index ca5e2a4c..4ece2e47 100644
+--- a/lib/compress/zstd_compress_internal.h
++++ b/lib/compress/zstd_compress_internal.h
+@@ -25,6 +25,7 @@
+ #endif
+ #include "../common/bits.h" /* ZSTD_highbit32, ZSTD_NbCommonBytes */
+ #include "zstd_preSplit.h" /* ZSTD_SLIPBLOCK_WORKSPACESIZE */
++#include "../common/zstd_trace_log.h"
+ 
+ /*-*************************************
+ *  Constants
+@@ -312,6 +313,9 @@ struct ZSTD_MatchState_t {
+      * at a small cost to compression ratio.
+      */
+     int lazySkipping;
++#if ZSTD_TRACE_LOG
++    ZSTD_traceLog_OpCtx* traceLogCtx;
++#endif
+ };
+ 
+ typedef struct {
+@@ -536,6 +540,9 @@ struct ZSTD_CCtx_s {
+ #if ZSTD_TRACE
+     ZSTD_TraceCtx traceCtx;
+ #endif
++#if ZSTD_TRACE_LOG
++    ZSTD_traceLog_OpCtx traceLogCtx;
++#endif
+ 
+     /* Workspace for block splitter */
+     ZSTD_blockSplitCtx blockSplitCtx;
+diff --git a/lib/compress/zstd_lazy.c b/lib/compress/zstd_lazy.c
+index 272ebe0e..36a9a6d7 100644
+--- a/lib/compress/zstd_lazy.c
++++ b/lib/compress/zstd_lazy.c
+@@ -687,6 +687,9 @@ size_t ZSTD_HcFindBestMatch(
+     const U32 lowLimit = isDictionary ? lowestValid : withinMaxDistance;
+     const U32 minChain = curr > chainSize ? curr - chainSize : 0;
+     U32 nbAttempts = 1U << cParams->searchLog;
++#if ZSTD_TRACE_LOG
++    U32 const traceInitialNbAttempts = nbAttempts;
++#endif
+     size_t ml=4-1;
+ 
+     const ZSTD_MatchState_t* const dms = ms->dictMatchState;
+@@ -731,6 +734,11 @@ size_t ZSTD_HcFindBestMatch(
+         matchIndex = NEXT_IN_CHAIN(matchIndex, chainMask);
+     }
+ 
++#if ZSTD_TRACE_LOG
++    if (ms->traceLogCtx) {
++        ZSTD_traceLog_recordSearchDepth(ms->traceLogCtx, traceInitialNbAttempts - nbAttempts);
++    }
++#endif
+     assert(nbAttempts <= (1U << ZSTD_SEARCHLOG_MAX)); /* Check we haven't underflowed. */
+     if (dictMode == ZSTD_dedicatedDictSearch) {
+         ml = ZSTD_dedicatedDictSearch_lazy_search(offsetPtr, ml, nbAttempts, dms,
+@@ -1167,10 +1175,13 @@ size_t ZSTD_RowFindBestMatch(
+     const U32 groupWidth = ZSTD_row_matchMaskGroupWidth(rowEntries);
+     const U64 hashSalt = ms->hashSalt;
+     U32 nbAttempts = 1U << cappedSearchLog;
++#if ZSTD_TRACE_LOG
++    U32 const traceInitialNbAttempts = nbAttempts;
++#endif
+     size_t ml=4-1;
+     U32 hash;
+ 
+-    /* DMS/DDS variables that may be referenced laster */
++    /* DMS/DDS variables that may be referenced laters */
+     const ZSTD_MatchState_t* const dms = ms->dictMatchState;
+ 
+     /* Initialize the following variables to satisfy static analyzer */
+@@ -1330,6 +1341,9 @@ size_t ZSTD_RowFindBestMatch(
+             }
+         }
+     }
++#if ZSTD_TRACE_LOG
++    ZSTD_traceLog_recordSearchDepth(ms->traceLogCtx, traceInitialNbAttempts - nbAttempts);
++#endif
+     return ml;
+ }
+ 
+@@ -1625,7 +1639,10 @@ size_t ZSTD_compressBlock_lazy_generic(
+         }
+ 
+         /* let's try to find a better solution */
+-        if (depth>=1)
++        if (depth>=1) {
++#if ZSTD_TRACE_LOG
++        ZSTD_traceLog_recordLazyAttempt(ms->traceLogCtx);
++#endif
+         while (ip<ilimit) {
+             DEBUGLOG(7, "search depth 1");
+             ip ++;
+@@ -1634,8 +1651,12 @@ size_t ZSTD_compressBlock_lazy_generic(
+                 size_t const mlRep = ZSTD_count(ip+4, ip+4-offset_1, iend) + 4;
+                 int const gain2 = (int)(mlRep * 3);
+                 int const gain1 = (int)(matchLength*3 - ZSTD_highbit32((U32)offBase) + 1);
+-                if ((mlRep >= 4) && (gain2 > gain1))
++                if ((mlRep >= 4) && (gain2 > gain1)) {
++#if ZSTD_TRACE_LOG
++                    ZSTD_traceLog_recordLazyImprovement(ms->traceLogCtx, (U32)matchLength, (U32)mlRep);
++#endif
+                     matchLength = mlRep, offBase = REPCODE1_TO_OFFBASE, start = ip;
++                }
+             }
+             if (isDxS) {
+                 const U32 repIndex = (U32)(ip - base) - offset_1;
+@@ -1648,8 +1669,12 @@ size_t ZSTD_compressBlock_lazy_generic(
+                     size_t const mlRep = ZSTD_count_2segments(ip+4, repMatch+4, iend, repMatchEnd, prefixLowest) + 4;
+                     int const gain2 = (int)(mlRep * 3);
+                     int const gain1 = (int)(matchLength*3 - ZSTD_highbit32((U32)offBase) + 1);
+-                    if ((mlRep >= 4) && (gain2 > gain1))
++                    if ((mlRep >= 4) && (gain2 > gain1)) {
++#if ZSTD_TRACE_LOG
++                        ZSTD_traceLog_recordLazyImprovement(ms->traceLogCtx, (U32)matchLength, (U32)mlRep);
++#endif
+                         matchLength = mlRep, offBase = REPCODE1_TO_OFFBASE, start = ip;
++                    }
+                 }
+             }
+             {   size_t ofbCandidate=999999999;
+@@ -1657,6 +1682,9 @@ size_t ZSTD_compressBlock_lazy_generic(
+                 int const gain2 = (int)(ml2*4 - ZSTD_highbit32((U32)ofbCandidate));   /* raw approx */
+                 int const gain1 = (int)(matchLength*4 - ZSTD_highbit32((U32)offBase) + 4);
+                 if ((ml2 >= 4) && (gain2 > gain1)) {
++#if ZSTD_TRACE_LOG
++                    ZSTD_traceLog_recordLazyImprovement(ms->traceLogCtx, (U32)matchLength, (U32)ml2);
++#endif
+                     matchLength = ml2, offBase = ofbCandidate, start = ip;
+                     continue;   /* search a better one */
+             }   }
+@@ -1670,8 +1698,12 @@ size_t ZSTD_compressBlock_lazy_generic(
+                     size_t const mlRep = ZSTD_count(ip+4, ip+4-offset_1, iend) + 4;
+                     int const gain2 = (int)(mlRep * 4);
+                     int const gain1 = (int)(matchLength*4 - ZSTD_highbit32((U32)offBase) + 1);
+-                    if ((mlRep >= 4) && (gain2 > gain1))
++                    if ((mlRep >= 4) && (gain2 > gain1)) {
++#if ZSTD_TRACE_LOG
++                        ZSTD_traceLog_recordLazyImprovement(ms->traceLogCtx, (U32)matchLength, (U32)mlRep);
++#endif
+                         matchLength = mlRep, offBase = REPCODE1_TO_OFFBASE, start = ip;
++                    }
+                 }
+                 if (isDxS) {
+                     const U32 repIndex = (U32)(ip - base) - offset_1;
+@@ -1684,8 +1716,12 @@ size_t ZSTD_compressBlock_lazy_generic(
+                         size_t const mlRep = ZSTD_count_2segments(ip+4, repMatch+4, iend, repMatchEnd, prefixLowest) + 4;
+                         int const gain2 = (int)(mlRep * 4);
+                         int const gain1 = (int)(matchLength*4 - ZSTD_highbit32((U32)offBase) + 1);
+-                        if ((mlRep >= 4) && (gain2 > gain1))
++                        if ((mlRep >= 4) && (gain2 > gain1)) {
++#if ZSTD_TRACE_LOG
++                            ZSTD_traceLog_recordLazyImprovement(ms->traceLogCtx, (U32)matchLength, (U32)mlRep);
++#endif
+                             matchLength = mlRep, offBase = REPCODE1_TO_OFFBASE, start = ip;
++                        }
+                     }
+                 }
+                 {   size_t ofbCandidate=999999999;
+@@ -1693,11 +1729,15 @@ size_t ZSTD_compressBlock_lazy_generic(
+                     int const gain2 = (int)(ml2*4 - ZSTD_highbit32((U32)ofbCandidate));   /* raw approx */
+                     int const gain1 = (int)(matchLength*4 - ZSTD_highbit32((U32)offBase) + 7);
+                     if ((ml2 >= 4) && (gain2 > gain1)) {
++#if ZSTD_TRACE_LOG
++                        ZSTD_traceLog_recordLazyImprovement(ms->traceLogCtx, (U32)matchLength, (U32)ml2);
++#endif
+                         matchLength = ml2, offBase = ofbCandidate, start = ip;
+                         continue;
+             }   }   }
+             break;  /* nothing found : store previous solution */
+         }
++        } /* if (depth>=1) */
+ 
+         /* NOTE:
+          * Pay attention that `start[-value]` can lead to strange undefined behavior
+diff --git a/lib/compress/zstd_opt.c b/lib/compress/zstd_opt.c
+index 3d7171b7..bf3a3529 100644
+--- a/lib/compress/zstd_opt.c
++++ b/lib/compress/zstd_opt.c
+@@ -624,6 +624,9 @@ ZSTD_insertBtAndGetAllMatches (
+     U32 dummy32;   /* to be nullified at the end */
+     U32 mnum = 0;
+     U32 nbCompares = 1U << cParams->searchLog;
++#if ZSTD_TRACE_LOG
++    U32 const traceInitialNbCompares = nbCompares;
++#endif
+ 
+     const ZSTD_MatchState_t* dms    = dictMode == ZSTD_dictMatchState ? ms->dictMatchState : NULL;
+     const ZSTD_compressionParameters* const dmsCParams =
+@@ -773,6 +776,11 @@ ZSTD_insertBtAndGetAllMatches (
+ 
+     *smallerPtr = *largerPtr = 0;
+ 
++#if ZSTD_TRACE_LOG
++    if (ms->traceLogCtx) {
++        ZSTD_traceLog_recordSearchDepth(ms->traceLogCtx, traceInitialNbCompares - nbCompares);
++    }
++#endif
+     assert(nbCompares <= (1U << ZSTD_SEARCHLOG_MAX)); /* Check we haven't underflowed. */
+     if (dictMode == ZSTD_dictMatchState && nbCompares) {
+         size_t const dmsH = ZSTD_hashPtr(ip, dmsHashLog, mls);
+@@ -1118,6 +1126,9 @@ ZSTD_compressBlock_opt_generic(ZSTD_MatchState_t* ms,
+     /* Match Loop */
+     while (ip < ilimit) {
+         U32 cur, last_pos = 0;
++#if ZSTD_TRACE_LOG
++        U32 traceOptMatches = 0;
++#endif
+ 
+         /* find first match */
+         {   U32 const litlen = (U32)(ip - anchor);
+@@ -1131,6 +1142,9 @@ ZSTD_compressBlock_opt_generic(ZSTD_MatchState_t* ms,
+                 ip++;
+                 continue;
+             }
++#if ZSTD_TRACE_LOG
++            traceOptMatches += nbMatches;
++#endif
+ 
+             /* Match found: let's store this solution, and eventually find more candidates.
+              * During this forward pass, @opt is used to store stretches,
+@@ -1286,6 +1300,9 @@ ZSTD_compressBlock_opt_generic(ZSTD_MatchState_t* ms,
+                     DEBUGLOG(7, "rPos:%u : no match found", cur);
+                     continue;
+                 }
++#if ZSTD_TRACE_LOG
++                traceOptMatches += nbMatches;
++#endif
+ 
+                 {   U32 const longestML = matches[nbMatches-1].len;
+                     DEBUGLOG(7, "cPos:%i==rPos:%u, found %u matches, of longest ML=%u",
+@@ -1337,6 +1354,11 @@ ZSTD_compressBlock_opt_generic(ZSTD_MatchState_t* ms,
+             opt[last_pos+1].price = ZSTD_MAX_PRICE;
+         }  /* for (cur = 1; cur <= last_pos; cur++) */
+ 
++#if ZSTD_TRACE_LOG
++        if (ms->traceLogCtx) {
++            ZSTD_traceLog_recordOptPositions(ms->traceLogCtx, last_pos, traceOptMatches);
++        }
++#endif
+         lastStretch = opt[last_pos];
+         assert(cur >= lastStretch.mlen);
+         cur = last_pos - lastStretch.mlen;
+diff --git a/lib/compress/zstdmt_compress.c b/lib/compress/zstdmt_compress.c
+index 0f1fe6d7..e9e5e34d 100644
+--- a/lib/compress/zstdmt_compress.c
++++ b/lib/compress/zstdmt_compress.c
+@@ -747,6 +747,10 @@ static void ZSTDMT_compressionJob(void* jobDescription)
+             if (ZSTD_isError(initError)) JOB_ERROR(initError);
+     }   }
+ 
++#if ZSTD_TRACE_LOG
++    cctx->traceLogCtx.entryApi = "ZSTDMT_compressionJob";
++#endif
++
+     /* External Sequences can only be applied after CCtx initialization */
+     ZSTDMT_serialState_applySequences(job->serial, cctx, &rawSeqStore);
+ 
+diff --git a/lib/decompress/zstd_decompress.c b/lib/decompress/zstd_decompress.c
+index 9eb98327..4e99819a 100644
+--- a/lib/decompress/zstd_decompress.c
++++ b/lib/decompress/zstd_decompress.c
+@@ -943,6 +943,18 @@ static void ZSTD_DCtx_trace_end(ZSTD_DCtx const* dctx, U64 uncompressedSize, U64
+     (void)compressedSize;
+     (void)streaming;
+ #endif
++#if ZSTD_TRACE_LOG
++    {   ZSTD_traceLog_OpCtx* traceLogCtx = (ZSTD_traceLog_OpCtx*)&dctx->traceLogCtx;
++        traceLogCtx->streaming = streaming;
++        if (streaming)
++            traceLogCtx->entryApi = "ZSTD_decompressStream";
++        if (dctx->ddict) {
++            traceLogCtx->dictID = ZSTD_getDictID_fromDDict(dctx->ddict);
++            traceLogCtx->dictSize = ZSTD_DDict_dictSize(dctx->ddict);
++        }
++        ZSTD_traceLog_endDecompress(traceLogCtx, uncompressedSize, compressedSize);
++    }
++#endif
+ }
+ 
+ 
+@@ -962,6 +974,7 @@ static size_t ZSTD_decompressFrame(ZSTD_DCtx* dctx,
+     size_t remainingSrcSize = *srcSizePtr;
+ 
+     DEBUGLOG(4, "ZSTD_decompressFrame (srcSize:%i)", (int)*srcSizePtr);
++    ZSTD_TRACE_LOG_FUNC(&dctx->traceLogCtx, "ZSTD_decompressFrame");
+ 
+     /* check */
+     RETURN_ERROR_IF(
+@@ -1139,6 +1152,9 @@ size_t ZSTD_decompressMultiFrame(ZSTD_DCtx* dctx,
+              * use this in all cases but ddict */
+             FORWARD_IF_ERROR(ZSTD_decompressBegin_usingDict(dctx, dict, dictSize), "");
+         }
++#if ZSTD_TRACE_LOG
++        dctx->traceLogCtx.entryApi = "ZSTD_decompress";
++#endif
+         ZSTD_checkContinuity(dctx, dst, dstCapacity);
+ 
+         {   const size_t res = ZSTD_decompressFrame(dctx, dst, dstCapacity,
+@@ -1275,6 +1291,7 @@ static int ZSTD_isSkipFrame(ZSTD_DCtx* dctx) { return dctx->stage == ZSTDds_skip
+ size_t ZSTD_decompressContinue(ZSTD_DCtx* dctx, void* dst, size_t dstCapacity, const void* src, size_t srcSize)
+ {
+     DEBUGLOG(5, "ZSTD_decompressContinue (srcSize:%u)", (unsigned)srcSize);
++    ZSTD_TRACE_LOG_FUNC(&dctx->traceLogCtx, "ZSTD_decompressContinue");
+     /* Sanity check */
+     RETURN_ERROR_IF(srcSize != ZSTD_nextSrcSizeToDecompressWithInputSize(dctx, srcSize), srcSize_wrong, "not allowed");
+     ZSTD_checkContinuity(dctx, dst, dstCapacity);
+@@ -1562,6 +1579,11 @@ size_t ZSTD_decompressBegin(ZSTD_DCtx* dctx)
+     assert(dctx != NULL);
+ #if ZSTD_TRACE
+     dctx->traceCtx = (ZSTD_trace_decompress_begin != NULL) ? ZSTD_trace_decompress_begin(dctx) : 0;
++#endif
++#if ZSTD_TRACE_LOG
++    ZSTD_traceLog_begin(&dctx->traceLogCtx, 0);
++    dctx->traceLogCtx.entryApi = "ZSTD_decompressBegin";
++    ZSTD_TRACE_LOG_FUNC(&dctx->traceLogCtx, "ZSTD_decompressBegin");
+ #endif
+     dctx->expected = ZSTD_startingInputLength(dctx->format);  /* dctx->format must be properly set */
+     dctx->stage = ZSTDds_getFrameHeaderSize;
+@@ -2096,6 +2118,7 @@ size_t ZSTD_decompressStream(ZSTD_DStream* zds, ZSTD_outBuffer* output, ZSTD_inB
+     U32 someMoreWork = 1;
+ 
+     DEBUGLOG(5, "ZSTD_decompressStream");
++    ZSTD_TRACE_LOG_FUNC(&zds->traceLogCtx, "ZSTD_decompressStream");
+     assert(zds != NULL);
+     RETURN_ERROR_IF(
+         input->pos > input->size,
+diff --git a/lib/decompress/zstd_decompress_internal.h b/lib/decompress/zstd_decompress_internal.h
+index e4bffdbc..247bbfc8 100644
+--- a/lib/decompress/zstd_decompress_internal.h
++++ b/lib/decompress/zstd_decompress_internal.h
+@@ -21,6 +21,7 @@
+  *********************************************************/
+ #include "../common/mem.h"             /* BYTE, U16, U32 */
+ #include "../common/zstd_internal.h"   /* constants : MaxLL, MaxML, MaxOff, LLFSELog, etc. */
++#include "../common/zstd_trace_log.h"
+ 
+ 
+ 
+@@ -208,6 +209,9 @@ struct ZSTD_DCtx_s
+ #if ZSTD_TRACE
+     ZSTD_TraceCtx traceCtx;
+ #endif
++#if ZSTD_TRACE_LOG
++    ZSTD_traceLog_OpCtx traceLogCtx;
++#endif
+ };  /* typedef'd to ZSTD_DCtx within "zstd.h" */
+ 
+ MEM_STATIC int ZSTD_DCtx_get_bmi2(const struct ZSTD_DCtx_s *dctx) {
+diff --git a/lib/libzstd.mk b/lib/libzstd.mk
+index 91bd4caf..42f438da 100644
+--- a/lib/libzstd.mk
++++ b/lib/libzstd.mk
+@@ -191,6 +191,11 @@ ifneq ($(ZSTD_LEGACY_MULTITHREADED_API), 0)
+   CFLAGS += -DZSTD_LEGACY_MULTITHREADED_API
+ endif
+ 
++# Trace logging: enabled by default. Set ZSTD_NO_TRACE_LOG=1 to disable.
++ifndef ZSTD_NO_TRACE_LOG
++  CPPFLAGS += -DZSTD_TRACE_LOG=1
++endif
++
+ ifneq ($(ZSTD_LIB_EXCLUDE_COMPRESSORS_DFAST_AND_UP), 0)
+   CFLAGS += -DZSTD_EXCLUDE_DFAST_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_GREEDY_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_LAZY2_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_BTLAZY2_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_BTOPT_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_BTULTRA_BLOCK_COMPRESSOR
+ else

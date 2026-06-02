@@ -25,6 +25,7 @@
 #endif
 #include "../common/bits.h" /* ZSTD_highbit32, ZSTD_NbCommonBytes */
 #include "zstd_preSplit.h" /* ZSTD_SLIPBLOCK_WORKSPACESIZE */
+#include "../common/zstd_trace_log.h"
 
 /*-*************************************
 *  Constants
@@ -312,6 +313,9 @@ struct ZSTD_MatchState_t {
      * at a small cost to compression ratio.
      */
     int lazySkipping;
+#if ZSTD_TRACE_LOG
+    ZSTD_traceLog_OpCtx* traceLogCtx;
+#endif
 };
 
 typedef struct {
@@ -535,6 +539,9 @@ struct ZSTD_CCtx_s {
     /* Tracing */
 #if ZSTD_TRACE
     ZSTD_TraceCtx traceCtx;
+#endif
+#if ZSTD_TRACE_LOG
+    ZSTD_traceLog_OpCtx traceLogCtx;
 #endif
 
     /* Workspace for block splitter */

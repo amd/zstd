@@ -3281,6 +3281,10 @@ static size_t ZSTD_buildSeqStore(ZSTD_CCtx* zc, const void* src, size_t srcSize)
 {
     ZSTD_MatchState_t* const ms = &zc->blockState.matchState;
     DEBUGLOG(5, "ZSTD_buildSeqStore (srcSize=%zu)", srcSize);
+    ZSTD_TRACE_LOG_FUNC(&zc->traceLogCtx, "ZSTD_buildSeqStore");
+#if ZSTD_TRACE_LOG
+    ms->traceLogCtx = &zc->traceLogCtx;
+#endif
     assert(srcSize <= ZSTD_BLOCKSIZE_MAX);
     /* Assert that we have correctly flushed the ctx params into the ms's copy */
     ZSTD_assertEqualCParams(zc->appliedParams.cParams, ms->cParams);
@@ -4385,11 +4389,19 @@ ZSTD_compressBlock_splitBlock(ZSTD_CCtx* zc,
             cSize = ZSTD_noCompressBlock(dst, dstCapacity, src, srcSize, lastBlock);
             FORWARD_IF_ERROR(cSize, "ZSTD_noCompressBlock failed");
             DEBUGLOG(5, "ZSTD_compressBlock_splitBlock: Nocompress block");
+#if ZSTD_TRACE_LOG
+            ZSTD_traceLog_recordBlockType(&zc->traceLogCtx, 0);
+#endif
             return cSize;
         }
         nbSeq = (U32)(zc->seqStore.sequences - zc->seqStore.sequencesStart);
     }
 
+#if ZSTD_TRACE_LOG
+    ZSTD_traceLog_addBlock(&zc->traceLogCtx, &zc->seqStore,
+                           (U32)srcSize, 0, 0);
+    ZSTD_traceLog_recordBlockType(&zc->traceLogCtx, 2);
+#endif
     cSize = ZSTD_compressBlock_splitBlock_internal(zc, dst, dstCapacity, src, srcSize, lastBlock, nbSeq);
     FORWARD_IF_ERROR(cSize, "Splitting blocks failed!");
     return cSize;
@@ -4411,6 +4423,7 @@ ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
     DEBUGLOG(5, "ZSTD_compressBlock_internal (dstCapacity=%u, dictLimit=%u, nextToUpdate=%u)",
                 (unsigned)dstCapacity, (unsigned)zc->blockState.matchState.window.dictLimit,
                 (unsigned)zc->blockState.matchState.nextToUpdate);
+    ZSTD_TRACE_LOG_FUNC(&zc->traceLogCtx, "ZSTD_compressBlock_internal");
 
     {   const size_t bss = ZSTD_buildSeqStore(zc, src, srcSize);
         FORWARD_IF_ERROR(bss, "ZSTD_buildSeqStore failed");
@@ -4452,7 +4465,19 @@ ZSTD_compressBlock_internal(ZSTD_CCtx* zc,
 out:
     if (!ZSTD_isError(cSize) && cSize > 1) {
         ZSTD_blockState_confirmRepcodesAndEntropyTables(&zc->blockState);
+#if ZSTD_TRACE_LOG
+        ZSTD_traceLog_addBlock(&zc->traceLogCtx, &zc->seqStore,
+                               (U32)srcSize, (U32)cSize, 0);
+        ZSTD_traceLog_recordBlockType(&zc->traceLogCtx, 2);
+#endif
     }
+#if ZSTD_TRACE_LOG
+    else if (!ZSTD_isError(cSize) && cSize == 0) {
+        ZSTD_traceLog_recordBlockType(&zc->traceLogCtx, 0);
+    } else if (!ZSTD_isError(cSize) && cSize == 1) {
+        ZSTD_traceLog_recordBlockType(&zc->traceLogCtx, 1);
+    }
+#endif
     /* We check that dictionaries have offset codes available for the first
      * block. After the first block, the offcode table might not have large
      * enough codes to represent the offsets in the data.
@@ -4618,6 +4643,7 @@ static size_t ZSTD_compress_frameChunk(ZSTD_CCtx* cctx,
     S64 savings = (S64)cctx->consumedSrcSize - (S64)cctx->producedCSize;
 
     assert(cctx->appliedParams.cParams.windowLog <= ZSTD_WINDOWLOG_MAX);
+    ZSTD_TRACE_LOG_FUNC(&cctx->traceLogCtx, "ZSTD_compress_frameChunk");
 
     DEBUGLOG(5, "ZSTD_compress_frameChunk (srcSize=%u, blockSizeMax=%u)", (unsigned)srcSize, (unsigned)blockSizeMax);
     if (cctx->appliedParams.fParams.checksumFlag && srcSize)
@@ -4815,6 +4841,7 @@ static size_t ZSTD_compressContinue_internal (ZSTD_CCtx* cctx,
 
     DEBUGLOG(5, "ZSTD_compressContinue_internal, stage: %u, srcSize: %u",
                 cctx->stage, (unsigned)srcSize);
+    ZSTD_TRACE_LOG_FUNC(&cctx->traceLogCtx, "ZSTD_compressContinue_internal");
     RETURN_ERROR_IF(cctx->stage==ZSTDcs_created, stage_wrong,
                     "missing init (ZSTD_compressBegin)");
 
@@ -5263,6 +5290,12 @@ static size_t ZSTD_compressBegin_internal(ZSTD_CCtx* cctx,
 #if ZSTD_TRACE
     cctx->traceCtx = (ZSTD_trace_compress_begin != NULL) ? ZSTD_trace_compress_begin(cctx) : 0;
 #endif
+#if ZSTD_TRACE_LOG
+    ZSTD_traceLog_begin(&cctx->traceLogCtx, 1);
+    ZSTD_traceLog_setParams(&cctx->traceLogCtx, params);
+    cctx->traceLogCtx.entryApi = "ZSTD_compressBegin_internal";
+    ZSTD_TRACE_LOG_FUNC(&cctx->traceLogCtx, "ZSTD_compressBegin_internal");
+#endif
     DEBUGLOG(4, "ZSTD_compressBegin_internal: wlog=%u", params->cParams.windowLog);
     /* params are supposed to be fully validated at this point */
     assert(!ZSTD_isError(ZSTD_checkCParams(params->cParams)));
@@ -5418,6 +5451,16 @@ void ZSTD_CCtx_trace(ZSTD_CCtx* cctx, size_t extraCSize)
     (void)cctx;
     (void)extraCSize;
 #endif
+#if ZSTD_TRACE_LOG
+    {   int const streaming = cctx->inBuffSize > 0 || cctx->outBuffSize > 0 || cctx->appliedParams.nbWorkers > 0;
+        cctx->traceLogCtx.streaming = streaming;
+        cctx->traceLogCtx.dictID = cctx->dictID;
+        cctx->traceLogCtx.dictSize = cctx->dictContentSize;
+        ZSTD_traceLog_end(&cctx->traceLogCtx,
+                          cctx->consumedSrcSize,
+                          cctx->producedCSize + extraCSize);
+    }
+#endif
 }
 
 size_t ZSTD_compressEnd_public(ZSTD_CCtx* cctx,
@@ -5482,6 +5525,9 @@ size_t ZSTD_compress_advanced_internal(
     FORWARD_IF_ERROR( ZSTD_compressBegin_internal(cctx,
                          dict, dictSize, ZSTD_dct_auto, ZSTD_dtlm_fast, NULL,
                          params, srcSize, ZSTDb_not_buffered) , "");
+#if ZSTD_TRACE_LOG
+    cctx->traceLogCtx.entryApi = "ZSTD_compress2";
+#endif
     return ZSTD_compressEnd_public(cctx, dst, dstCapacity, src, srcSize);
 }
 
@@ -6412,6 +6458,12 @@ static size_t ZSTD_CCtx_init_compressStream2(ZSTD_CCtx* cctx,
 # if ZSTD_TRACE
         cctx->traceCtx = (ZSTD_trace_compress_begin != NULL) ? ZSTD_trace_compress_begin(cctx) : 0;
 # endif
+#if ZSTD_TRACE_LOG
+        ZSTD_traceLog_begin(&cctx->traceLogCtx, 1);
+        ZSTD_traceLog_setParams(&cctx->traceLogCtx, &params);
+        cctx->traceLogCtx.entryApi = "ZSTD_compressStream2";
+        ZSTD_TRACE_LOG_FUNC(&cctx->traceLogCtx, "ZSTD_CCtx_init_compressStream2[MT]");
+#endif
         /* mt context creation */
         if (cctx->mtctx == NULL) {
             DEBUGLOG(4, "ZSTD_compressStream2: creating new mtctx for nbWorkers=%u",
@@ -6440,6 +6492,9 @@ static size_t ZSTD_CCtx_init_compressStream2(ZSTD_CCtx* cctx,
                 cctx->cdict,
                 &params, pledgedSrcSize,
                 ZSTDb_buffered) , "");
+#if ZSTD_TRACE_LOG
+        cctx->traceLogCtx.entryApi = "ZSTD_compressStream2";
+#endif
         assert(cctx->appliedParams.nbWorkers == 0);
         cctx->inToCompress = 0;
         cctx->inBuffPos = 0;

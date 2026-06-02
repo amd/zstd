@@ -687,6 +687,9 @@ size_t ZSTD_HcFindBestMatch(
     const U32 lowLimit = isDictionary ? lowestValid : withinMaxDistance;
     const U32 minChain = curr > chainSize ? curr - chainSize : 0;
     U32 nbAttempts = 1U << cParams->searchLog;
+#if ZSTD_TRACE_LOG
+    U32 const traceInitialNbAttempts = nbAttempts;
+#endif
     size_t ml=4-1;
 
     const ZSTD_MatchState_t* const dms = ms->dictMatchState;
@@ -731,6 +734,11 @@ size_t ZSTD_HcFindBestMatch(
         matchIndex = NEXT_IN_CHAIN(matchIndex, chainMask);
     }
 
+#if ZSTD_TRACE_LOG
+    if (ms->traceLogCtx) {
+        ZSTD_traceLog_recordSearchDepth(ms->traceLogCtx, traceInitialNbAttempts - nbAttempts);
+    }
+#endif
     assert(nbAttempts <= (1U << ZSTD_SEARCHLOG_MAX)); /* Check we haven't underflowed. */
     if (dictMode == ZSTD_dedicatedDictSearch) {
         ml = ZSTD_dedicatedDictSearch_lazy_search(offsetPtr, ml, nbAttempts, dms,
@@ -1211,10 +1219,13 @@ size_t ZSTD_RowFindBestMatch(
     const U32 groupWidth = ZSTD_row_matchMaskGroupWidth(rowEntries);
     const U64 hashSalt = ms->hashSalt;
     U32 nbAttempts = 1U << cappedSearchLog;
+#if ZSTD_TRACE_LOG
+    U32 const traceInitialNbAttempts = nbAttempts;
+#endif
     size_t ml=4-1;
     U32 hash;
 
-    /* DMS/DDS variables that may be referenced laster */
+    /* DMS/DDS variables that may be referenced laters */
     const ZSTD_MatchState_t* const dms = ms->dictMatchState;
 
     /* Initialize the following variables to satisfy static analyzer */
@@ -1374,6 +1385,9 @@ size_t ZSTD_RowFindBestMatch(
             }
         }
     }
+#if ZSTD_TRACE_LOG
+    ZSTD_traceLog_recordSearchDepth(ms->traceLogCtx, traceInitialNbAttempts - nbAttempts);
+#endif
     return ml;
 }
 
@@ -1669,7 +1683,10 @@ size_t ZSTD_compressBlock_lazy_generic(
         }
 
         /* let's try to find a better solution */
-        if (depth>=1)
+        if (depth>=1) {
+#if ZSTD_TRACE_LOG
+        ZSTD_traceLog_recordLazyAttempt(ms->traceLogCtx);
+#endif
         while (ip<ilimit) {
             DEBUGLOG(7, "search depth 1");
             ip ++;
@@ -1678,8 +1695,12 @@ size_t ZSTD_compressBlock_lazy_generic(
                 size_t const mlRep = ZSTD_count(ip+4, ip+4-offset_1, iend) + 4;
                 int const gain2 = (int)(mlRep * 3);
                 int const gain1 = (int)(matchLength*3 - ZSTD_highbit32((U32)offBase) + 1);
-                if ((mlRep >= 4) && (gain2 > gain1))
+                if ((mlRep >= 4) && (gain2 > gain1)) {
+#if ZSTD_TRACE_LOG
+                    ZSTD_traceLog_recordLazyImprovement(ms->traceLogCtx, (U32)matchLength, (U32)mlRep);
+#endif
                     matchLength = mlRep, offBase = REPCODE1_TO_OFFBASE, start = ip;
+                }
             }
             if (isDxS) {
                 const U32 repIndex = (U32)(ip - base) - offset_1;
@@ -1692,8 +1713,12 @@ size_t ZSTD_compressBlock_lazy_generic(
                     size_t const mlRep = ZSTD_count_2segments(ip+4, repMatch+4, iend, repMatchEnd, prefixLowest) + 4;
                     int const gain2 = (int)(mlRep * 3);
                     int const gain1 = (int)(matchLength*3 - ZSTD_highbit32((U32)offBase) + 1);
-                    if ((mlRep >= 4) && (gain2 > gain1))
+                    if ((mlRep >= 4) && (gain2 > gain1)) {
+#if ZSTD_TRACE_LOG
+                        ZSTD_traceLog_recordLazyImprovement(ms->traceLogCtx, (U32)matchLength, (U32)mlRep);
+#endif
                         matchLength = mlRep, offBase = REPCODE1_TO_OFFBASE, start = ip;
+                    }
                 }
             }
             {   size_t ofbCandidate=999999999;
@@ -1701,6 +1726,9 @@ size_t ZSTD_compressBlock_lazy_generic(
                 int const gain2 = (int)(ml2*4 - ZSTD_highbit32((U32)ofbCandidate));   /* raw approx */
                 int const gain1 = (int)(matchLength*4 - ZSTD_highbit32((U32)offBase) + 4);
                 if ((ml2 >= 4) && (gain2 > gain1)) {
+#if ZSTD_TRACE_LOG
+                    ZSTD_traceLog_recordLazyImprovement(ms->traceLogCtx, (U32)matchLength, (U32)ml2);
+#endif
                     matchLength = ml2, offBase = ofbCandidate, start = ip;
                     continue;   /* search a better one */
             }   }
@@ -1714,8 +1742,12 @@ size_t ZSTD_compressBlock_lazy_generic(
                     size_t const mlRep = ZSTD_count(ip+4, ip+4-offset_1, iend) + 4;
                     int const gain2 = (int)(mlRep * 4);
                     int const gain1 = (int)(matchLength*4 - ZSTD_highbit32((U32)offBase) + 1);
-                    if ((mlRep >= 4) && (gain2 > gain1))
+                    if ((mlRep >= 4) && (gain2 > gain1)) {
+#if ZSTD_TRACE_LOG
+                        ZSTD_traceLog_recordLazyImprovement(ms->traceLogCtx, (U32)matchLength, (U32)mlRep);
+#endif
                         matchLength = mlRep, offBase = REPCODE1_TO_OFFBASE, start = ip;
+                    }
                 }
                 if (isDxS) {
                     const U32 repIndex = (U32)(ip - base) - offset_1;
@@ -1728,8 +1760,12 @@ size_t ZSTD_compressBlock_lazy_generic(
                         size_t const mlRep = ZSTD_count_2segments(ip+4, repMatch+4, iend, repMatchEnd, prefixLowest) + 4;
                         int const gain2 = (int)(mlRep * 4);
                         int const gain1 = (int)(matchLength*4 - ZSTD_highbit32((U32)offBase) + 1);
-                        if ((mlRep >= 4) && (gain2 > gain1))
+                        if ((mlRep >= 4) && (gain2 > gain1)) {
+#if ZSTD_TRACE_LOG
+                            ZSTD_traceLog_recordLazyImprovement(ms->traceLogCtx, (U32)matchLength, (U32)mlRep);
+#endif
                             matchLength = mlRep, offBase = REPCODE1_TO_OFFBASE, start = ip;
+                        }
                     }
                 }
                 {   size_t ofbCandidate=999999999;
@@ -1737,11 +1773,15 @@ size_t ZSTD_compressBlock_lazy_generic(
                     int const gain2 = (int)(ml2*4 - ZSTD_highbit32((U32)ofbCandidate));   /* raw approx */
                     int const gain1 = (int)(matchLength*4 - ZSTD_highbit32((U32)offBase) + 7);
                     if ((ml2 >= 4) && (gain2 > gain1)) {
+#if ZSTD_TRACE_LOG
+                        ZSTD_traceLog_recordLazyImprovement(ms->traceLogCtx, (U32)matchLength, (U32)ml2);
+#endif
                         matchLength = ml2, offBase = ofbCandidate, start = ip;
                         continue;
             }   }   }
             break;  /* nothing found : store previous solution */
         }
+        } /* if (depth>=1) */
 
         /* NOTE:
          * Pay attention that `start[-value]` can lead to strange undefined behavior

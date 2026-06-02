@@ -624,6 +624,9 @@ ZSTD_insertBtAndGetAllMatches (
     U32 dummy32;   /* to be nullified at the end */
     U32 mnum = 0;
     U32 nbCompares = 1U << cParams->searchLog;
+#if ZSTD_TRACE_LOG
+    U32 const traceInitialNbCompares = nbCompares;
+#endif
 
     const ZSTD_MatchState_t* dms    = dictMode == ZSTD_dictMatchState ? ms->dictMatchState : NULL;
     const ZSTD_compressionParameters* const dmsCParams =
@@ -773,6 +776,11 @@ ZSTD_insertBtAndGetAllMatches (
 
     *smallerPtr = *largerPtr = 0;
 
+#if ZSTD_TRACE_LOG
+    if (ms->traceLogCtx) {
+        ZSTD_traceLog_recordSearchDepth(ms->traceLogCtx, traceInitialNbCompares - nbCompares);
+    }
+#endif
     assert(nbCompares <= (1U << ZSTD_SEARCHLOG_MAX)); /* Check we haven't underflowed. */
     if (dictMode == ZSTD_dictMatchState && nbCompares) {
         size_t const dmsH = ZSTD_hashPtr(ip, dmsHashLog, mls);
@@ -1118,6 +1126,9 @@ ZSTD_compressBlock_opt_generic(ZSTD_MatchState_t* ms,
     /* Match Loop */
     while (ip < ilimit) {
         U32 cur, last_pos = 0;
+#if ZSTD_TRACE_LOG
+        U32 traceOptMatches = 0;
+#endif
 
         /* find first match */
         {   U32 const litlen = (U32)(ip - anchor);
@@ -1131,6 +1142,9 @@ ZSTD_compressBlock_opt_generic(ZSTD_MatchState_t* ms,
                 ip++;
                 continue;
             }
+#if ZSTD_TRACE_LOG
+            traceOptMatches += nbMatches;
+#endif
 
             /* Match found: let's store this solution, and eventually find more candidates.
              * During this forward pass, @opt is used to store stretches,
@@ -1286,6 +1300,9 @@ ZSTD_compressBlock_opt_generic(ZSTD_MatchState_t* ms,
                     DEBUGLOG(7, "rPos:%u : no match found", cur);
                     continue;
                 }
+#if ZSTD_TRACE_LOG
+                traceOptMatches += nbMatches;
+#endif
 
                 {   U32 const longestML = matches[nbMatches-1].len;
                     DEBUGLOG(7, "cPos:%i==rPos:%u, found %u matches, of longest ML=%u",
@@ -1337,6 +1354,11 @@ ZSTD_compressBlock_opt_generic(ZSTD_MatchState_t* ms,
             opt[last_pos+1].price = ZSTD_MAX_PRICE;
         }  /* for (cur = 1; cur <= last_pos; cur++) */
 
+#if ZSTD_TRACE_LOG
+        if (ms->traceLogCtx) {
+            ZSTD_traceLog_recordOptPositions(ms->traceLogCtx, last_pos, traceOptMatches);
+        }
+#endif
         lastStretch = opt[last_pos];
         assert(cur >= lastStretch.mlen);
         cur = last_pos - lastStretch.mlen;

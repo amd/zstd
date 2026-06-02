@@ -21,6 +21,7 @@
  *********************************************************/
 #include "../common/mem.h"             /* BYTE, U16, U32 */
 #include "../common/zstd_internal.h"   /* constants : MaxLL, MaxML, MaxOff, LLFSELog, etc. */
+#include "../common/zstd_trace_log.h"
 
 
 
@@ -207,6 +208,9 @@ struct ZSTD_DCtx_s
     /* Tracing */
 #if ZSTD_TRACE
     ZSTD_TraceCtx traceCtx;
+#endif
+#if ZSTD_TRACE_LOG
+    ZSTD_traceLog_OpCtx traceLogCtx;
 #endif
 };  /* typedef'd to ZSTD_DCtx within "zstd.h" */
 

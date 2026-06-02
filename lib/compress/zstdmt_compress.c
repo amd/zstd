@@ -747,6 +747,10 @@ static void ZSTDMT_compressionJob(void* jobDescription)
             if (ZSTD_isError(initError)) JOB_ERROR(initError);
     }   }
 
+#if ZSTD_TRACE_LOG
+    cctx->traceLogCtx.entryApi = "ZSTDMT_compressionJob";
+#endif
+
     /* External Sequences can only be applied after CCtx initialization */
     ZSTDMT_serialState_applySequences(job->serial, cctx, &rawSeqStore);
 
